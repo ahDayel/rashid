@@ -1,0 +1,23 @@
+<!-- frontend/index.html -->
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <title>راشد</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="./style.css" />
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+</head>
+<body>
+  <main class="app">
+    <div class="video-wrap">
+      <img id="avatar" src="assets/avatar.png" alt="Rashid Avatar" />
+    </div>
+    <div class="chat">
+      <div id="log" class="log"></div>
+      <div class="mic-status" id="micStatus">⏸️ بانتظار اقتراب شخص أمام الكاميرا…</div>
+    </div>
+  </main>
+  <script src="./main.js"></script>
+</body>
+</html>

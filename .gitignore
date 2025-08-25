@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Virtual env
+.venv/
+env/
+venv/
+
+# Frontend / build
+node_modules/
+dist/
+*.map
+
+# Editors / OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Secrets & data
+.env
+data/
+*.db
+*.sqlite
+
+# Media (كبيرة)
+*.mp4
+*.wav
+*.mp3
+frontend/assets/*.mp4

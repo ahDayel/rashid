@@ -1,0 +1,64 @@
+* {
+    box-sizing: border-box
+}
+
+body {
+    margin: 0;
+    background: #0b0b0b;
+    color: #e8ffff;
+    font-family: system-ui, Segoe UI, Arial
+}
+
+.app {
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    gap: 18px;
+    min-height: 100vh
+}
+
+.video-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #000
+}
+
+.video-wrap video {
+    width: 100%;
+    max-width: 980px;
+    max-height: 85vh;
+    object-fit: contain
+}
+
+.chat {
+    padding: 16px;
+    background: #0f1418;
+    border-left: 1px solid #1e2a33;
+    display: flex;
+    flex-direction: column
+}
+
+.log {
+    flex: 1;
+    overflow: auto;
+    background: #0b1216;
+    border: 1px solid #1e2a33;
+    border-radius: 10px;
+    padding: 10px
+}
+
+.log .bot {
+    color: #76e5ff;
+    margin: 6px 0
+}
+
+.log .user {
+    color: #ffd36e;
+    margin: 6px 0;
+    text-align: left
+}
+
+.mic-status {
+    margin-top: 10px;
+    color: #8ac9ff
+}
