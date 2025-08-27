@@ -201,7 +201,7 @@ def on_user_text(data):
 # ===== ترحيب/توديع بالحضور =====
 def greet_on_arrival():
     # ترحيب ذكي + قفل الاستماع في الواجهة (speaking=True)
-    reply = "يَا هَلَا وَاللَّه! حَيَّاكَ اللَّه فِي هَاكْثُون أَمِّد! أَنَا رَاشِد، مُسَاعِد الْمُشَارِكِين الذَّكِيّ. هَلْ تِبْغَى أُسَاعِدَك فِي إِيْجَاد مُبَادَرَة تِنَاسِب فِكْرَتَك، وَلَّا عِنْدَك سُؤَال عَنْ لَوَائِح الْهَاكْثُون؟"
+    reply = " حَيَّاكَ اللَّه! أَنَا رَاشِد، كيف اقدر اخدمك؟"
     socketio.emit("speak_state", {"speaking": True})
     socketio.emit('voice_response', {'text': reply})
     socketio.emit('server_response', {'data': reply})
@@ -238,9 +238,11 @@ def handle_user_text(user_text: str):
 
 
 # ===== كاشف الوجه (MediaPipe) =====
-def face_presence_watcher(cam_index=0, min_frames=3, lost_frames=10):
+def face_presence_watcher(cam_index=0, greet_delay_s=2.0, farewell_delay_s=5.0,
+                          min_conf=0.6, min_area=0.04):
     """
-    يراقب الكاميرا، ويرسل presence للمقدمة، ويشغّل الترحيب/الوداع.
+    يراقب الكاميرا ويُفعّل الترحيب بعد ثبات وجود الوجه لمدة greet_delay_s،
+    ويُفعّل التوديع بعد اختفاء الوجه لمدة farewell_delay_s.
     """
     global face_present
     try:
@@ -255,50 +257,72 @@ def face_presence_watcher(cam_index=0, min_frames=3, lost_frames=10):
         return
 
     mp_fd = mp.solutions.face_detection
-    seen, lost = 0, 0
 
-    with mp_fd.FaceDetection(model_selection=0, min_detection_confidence=0.6) as fd:
+    # طوابع زمنية لضبط التأخير
+    first_seen_ts = None         # أول لحظة بدأ فيها الوجه يظهر بشكل متواصل
+    last_seen_ts = None          # آخر لحظة كان فيها الوجه ظاهر
+    greeted = False              # هل قد طُلب الترحيب لهذه الجلسة؟
+
+    with mp_fd.FaceDetection(model_selection=0, min_detection_confidence=min_conf) as fd:
         while True:
             ok, frame = cap.read()
             if not ok:
-                sleep(0.05)
+                sleep(0.03)
                 continue
+
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             res = fd.process(rgb)
 
+            # تحقّق وجود وجه بمساحة كافية
             has_face = False
             if res and res.detections:
                 for det in res.detections:
                     bb = det.location_data.relative_bounding_box
-                    if max(bb.width, 0)*max(bb.height, 0) >= 0.04:
+                    if max(bb.width, 0) * max(bb.height, 0) >= min_area:
                         has_face = True
                         break
 
+            now = monotonic()
+
             if has_face:
-                seen += 1
-                lost = 0
-                if not face_present and seen >= min_frames:
+                last_seen_ts = now
+                if first_seen_ts is None:
+                    first_seen_ts = now
+
+                # إذا لم نُرحّب بعد، وانتظم الوجود لمدة كافية -> رحّب
+                if not greeted and (now - first_seen_ts) >= greet_delay_s:
                     face_present = True
+                    greeted = True
                     socketio.emit("presence", {"present": True})
-                    logger.info("🟢 Face detected")
+                    logger.info("🟢 Face present (stable) -> greet")
                     greet_on_arrival()
             else:
-                lost += 1
-                seen = 0
-                if face_present and lost >= lost_frames:
-                    face_present = False
-                    socketio.emit("presence", {"present": False})
-                    logger.info("⚪ Face lost")
-                    farewell_on_leave()
+                # لا يوجد وجه: صفّر بداية الظهور، وراقب زمن الغياب
+                first_seen_ts = None
+                if last_seen_ts is not None and greeted:
+                    if (now - last_seen_ts) >= farewell_delay_s:
+                        # غياب مستقر بما يكفي -> وداع
+                        face_present = False
+                        greeted = False
+                        last_seen_ts = None
+                        socketio.emit("presence", {"present": False})
+                        logger.info("⚪ Face absent (stable) -> farewell")
+                        farewell_on_leave()
 
-            sleep(0.05)
+            # سليب خفيف لتقليل الحمل (لا يعتمد على الزمن كمعيار)
+            sleep(0.03)
+
 
 # ===== التشغيل =====
 if __name__ == "__main__":
     logger.info("🚀 Starting Rashid Kiosk...")
     load_video_frames()
     threading.Thread(target=video_loop, daemon=True).start()
-    threading.Thread(target=face_presence_watcher, args=(0,), daemon=True).start()
+    threading.Thread(
+    target=face_presence_watcher,
+    args=(0, 2.0, 5.0),  # greet_delay_s=2s, farewell_delay_s=5s
+    daemon=True
+    ).start()
     logger.info("🌐 Open frontend: frontend/index.html")
     socketio.run(app, host="0.0.0.0", port=5000, debug=False)
 
