@@ -1,341 +1,404 @@
-# app.py
-import os, base64, time, threading
+import os, time, base64, threading
 from time import monotonic, sleep
 from pathlib import Path
 
 import cv2
 import numpy as np
-from flask import Flask, request
+import requests
+from flask import Flask, send_from_directory, request, Response
 from flask_socketio import SocketIO, emit
 from loguru import logger
 from dotenv import load_dotenv
 
-# ===== تحميل المفاتيح والبيئة =====
-BASE_DIR = Path(__file__).resolve().parent
-FRONT_DIR = BASE_DIR.parent / "frontend"
+# -------------------- Paths / Flask --------------------
+BASE_DIR   = Path(__file__).resolve().parent
+FRONT_DIR  = BASE_DIR.parent / "frontend"
 ASSETS_DIR = FRONT_DIR / "assets"
-
 load_dotenv(BASE_DIR / ".env")
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder=str(FRONT_DIR), static_url_path="")
 app.config["SECRET_KEY"] = "rashid_kiosk_2025"
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading", ping_timeout=60, ping_interval=25)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
+                    ping_timeout=60, ping_interval=25)
 
-# ===== حالة الجلسة =====
-face_present = False          # هل في شخص قدام الكاميرا
-engaged = False               # قلنا له الترحيب ولا بعد
-is_speaking = False           # راشد يتكلم الآن؟
-last_reply_time = 0.0         # حاجز الإيكو
+@app.route("/")
+def index():
+    return send_from_directory(str(FRONT_DIR), "index.html")
 
-# NEW: مخزن الجلسات لكل عميل
-SESSIONS = {}  # key = request.sid -> {"history": [...], "slots": {...}, "pending_question": None}
+@app.route("/assets/<path:filename>")
+def assets(filename):
+    return send_from_directory(str(ASSETS_DIR), filename)
 
-# ===== الفيديو (أفاتار) =====
-video_frames = {"silent": [], "speaking": [], "listening" : [] }
+@app.route("/favicon.ico")
+def favicon():
+    fav = ASSETS_DIR / "favicon.ico"
+    if fav.exists():
+        return send_from_directory(str(ASSETS_DIR), "favicon.ico")
+    return ("", 204)
+
+# -------------------- Azure token (optional) --------------------
+AZURE_KEY    = os.getenv("AZURE_SPEECH_KEY", "")
+AZURE_REGION = os.getenv("AZURE_SPEECH_REGION", "qatarcentral")
+
+@app.route("/azure/token")
+def azure_token():
+    if not AZURE_KEY:
+        return Response("AZURE_SPEECH_KEY missing", status=500)
+    url = f"https://{AZURE_REGION}.api.cognitive.microsoft.com/sts/v1.0/issueToken"
+    try:
+        r = requests.post(url, headers={"Ocp-Apim-Subscription-Key": AZURE_KEY}, timeout=8)
+        if r.ok and r.text:
+            return r.text
+        return Response(f"token http {r.status_code}: {r.text}", status=500)
+    except Exception as e:
+        return Response(f"token error: {e}", status=500)
+
+# -------------------- Avatar (silent loop) --------------------
+video_frames = {"silent": []}
 default_frame = None
 frame_idx = 0
-
 SILENT_MP4   = ASSETS_DIR / "rashid_silent.mp4"
-SPEAKING_MP4 = ASSETS_DIR / "rashid_speaking.mp4"
-LISTENING_MP4 = ASSETS_DIR / "rashid_listening.mp4"
 FALLBACK_PNG = ASSETS_DIR / "avatar.png"
-
 
 def _create_default_frame():
     global default_frame
-    # صورة سوداء مع كتابة، ولو فيه avatar.png نستخدمه
     if FALLBACK_PNG.exists():
         img = cv2.imread(str(FALLBACK_PNG))
         if img is not None:
-            default_frame = cv2.resize(img, (1280, 720))
-            return
-    default_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-    cv2.putText(default_frame, "Rashid Assistant", (380, 370),
-                cv2.FONT_HERSHEY_SIMPLEX, 2.0, (255, 255, 255), 3)
+            default_frame = cv2.resize(img, (1280, 720)); return
+    default_frame = np.zeros((720,1280,3), dtype=np.uint8)
+    cv2.putText(default_frame, "Rashid Assistant", (380,370),
+                cv2.FONT_HERSHEY_SIMPLEX, 2.0, (255,255,255), 3)
 
-
-def _load_video(path: Path, key: str):
-    if not path.exists():
-        return
+def _load_video(path: Path):
+    if not path.exists(): return
     cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
-        return
+    if not cap.isOpened(): return
     while True:
         ok, frame = cap.read()
-        if not ok:
-            break
-        frame = cv2.resize(frame, (1280, 720))
-        video_frames[key].append(frame)
+        if not ok: break
+        video_frames["silent"].append(cv2.resize(frame, (1280,720)))
     cap.release()
-    logger.info(f"✅ {key} frames: {len(video_frames[key])}")
-
 
 def load_video_frames():
-    logger.info("🎬 Loading avatar frames...")
     try:
-        _load_video(SILENT_MP4, "silent")
-        _load_video(SPEAKING_MP4, "speaking")
-        if not video_frames["silent"] and not video_frames["speaking"]:
+        _load_video(SILENT_MP4)
+        if not video_frames["silent"]:
             _create_default_frame()
-    except Exception as e:
-        logger.error(f"❌ load_video_frames: {e}")
+    except Exception:
         _create_default_frame()
-
 
 def get_current_frame():
     global frame_idx
     try:
-        if is_speaking and video_frames["speaking"]:
-            f = video_frames["speaking"][frame_idx % len(video_frames["speaking"])]
-        elif video_frames["silent"]:
-            f = video_frames["silent"][frame_idx % len(video_frames["silent"])]
-        else:
-            f = default_frame
+        f = video_frames["silent"][frame_idx % len(video_frames["silent"])] if video_frames["silent"] else default_frame
         frame_idx += 1
         return f
-    except Exception as e:
-        logger.error(f"❌ get_current_frame: {e}")
+    except Exception:
         return default_frame
 
-
 def frame_to_b64(frame):
-    try:
-        _, buf = cv2.imencode(".jpg", frame)
-        return base64.b64encode(buf).decode("utf-8")
-    except Exception as e:
-        logger.error(f"❌ frame_to_b64: {e}")
-        return None
-
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+    return base64.b64encode(buf).decode("utf-8") if ok else None
 
 def video_loop():
     while True:
-        try:
-            bgr = get_current_frame()
-            b64 = frame_to_b64(bgr)
-            if b64:
-                socketio.emit("video_frame", {"frame": b64})
-            sleep(1/30)
-        except Exception as e:
-            logger.error(f"❌ video_loop: {e}")
-            sleep(0.5)
+        b64 = frame_to_b64(get_current_frame())
+        if b64:
+            socketio.emit("video_frame", {"frame": b64})
+        sleep(1/30)
 
-# ===== التحكم بحالة الكلام لمنع الإيكو =====
-def set_speaking(flag: bool):
-    global is_speaking, last_reply_time
-    is_speaking = bool(flag)
-    socketio.emit("speak_state", {"speaking": is_speaking})
-    if is_speaking:
-        last_reply_time = monotonic()
+# -------------------- Per-client Conversation State --------------------
+# We strictly gate speech & presence so nothing overlaps.
+CLIENT = {}  # sid -> {...}
 
+def _get_state(sid: str):
+    st = CLIENT.get(sid)
+    if st is None:
+        st = CLIENT[sid] = {
+            "present": False,
+            "speaking": False,        # server-side lock (set in _say_to + tts_start/tts_end)
+            "last_reply_ts": 0.0,     # time.monotonic()
+            "greeted": False,
+            "last_greet_ts": 0.0,
+            "last_farewell_ts": 0.0,
+            # STT dedupe:
+            "last_user_text": "",
+            "last_user_ts": 0.0,
+        }
+    return st
 
-def say(text: str):
+ENTER_DELAY_S      = float(os.getenv("ENTER_DELAY_S", 0.7))
+LEAVE_DELAY_S      = float(os.getenv("LEAVE_DELAY_S", 1.8))
+SERVER_MIN_AREA    = float(os.getenv("SERVER_MIN_AREA", 0.006))   # 0.6%
+GREET_COOLDOWN     = 8.0
+BYE_COOLDOWN       = 8.0
+POST_SPEECH_GRACE  = 1.5  # seconds after TTS before considering farewell
+STT_DEDUPE_WINDOW  = 2.0  # ignore identical final results within 2s
+SPEAK_WATCHDOG_PAD = 1.0  # add to TTS duration in case tts_end is missed
+
+def _now(): return monotonic()
+
+def _normalize(t: str) -> str:
+    return " ".join((t or "").strip().lower().split())
+
+def _say_to(sid: str, text: str, seconds: float = 3.0):
     """
-    يرسل ردّ نصي وصوتي + يضبط speaking True لفترة قصيرة حتى ما يسمع نفسه.
+    Speak exactly one thing at a time:
+    - Set a server-side 'speaking' lock immediately.
+    - Emit voice_response (client will do TTS and also send tts_start/tts_end).
+    - Watchdog releases the lock even if client never sends tts_end.
     """
-    set_speaking(True)
-    socketio.emit("server_response", {"data": text})
-    socketio.emit("voice_response", {"text": text})
-
-    # خفّض speaking بعد شوي (يُعطي وقت للمتصفح يوقف الاستماع)
-    def _reset():
-        sleep(3.5)
-        set_speaking(False)
-    threading.Thread(target=_reset, daemon=True).start()
-
-# ===== LLM =====
-from llm import smart_answer  # يُرجع dict فيه {text, mode, sources}
-
-# ===== Socket.IO =====
-@socketio.on('connect')
-def on_connect():
-    logger.info("🔌 Client connected")
-    emit('connection_status', {'status': 'connected'})
-
-
-@socketio.on("disconnect")
-def on_disconnect():
-    logger.info("🔌 Client disconnected")
-
-@socketio.on('start_stream')
-def on_start_stream():
-    frame = get_current_frame()
-    b64 = frame_to_b64(frame)
-    if b64:
-        emit('video_frame', {'frame': b64})
-
-@socketio.on('voice_input')
-def on_voice_input(data):
-    user_text = (data or {}).get("text", "").strip()
-    if not user_text:
+    st = _get_state(sid)
+    if st["speaking"]:
+        logger.debug("drop speak (busy)")
         return
-    handle_user_text(user_text)
+
+    st["speaking"] = True
+    st["last_reply_ts"] = _now()
+    # Let clients optionally update UI immediately
+    socketio.emit("speak_state", {"speaking": True}, to=sid)
+
+    socketio.emit("voice_response", {"text": text}, to=sid)
+    socketio.emit("server_response", {"data": text}, to=sid)
+
+    def _watchdog():
+        # If client never calls tts_end, release lock after seconds + pad
+        time.sleep(seconds + SPEAK_WATCHDOG_PAD)
+        st2 = _get_state(sid)
+        if st2["speaking"]:
+            st2["speaking"] = False
+            st2["last_reply_ts"] = _now()
+            socketio.emit("speak_state", {"speaking": False}, to=sid)
+
+    threading.Thread(target=_watchdog, daemon=True).start()
+
+# -------------------- Presence debounced + gated --------------------
+STATE  = {}  # sid -> {"last_eval": False, "since": monotonic(), "n": 0}
+
+def _update_presence_for_sid(sid: str, want_present: bool):
+    now = _now()
+    st  = _get_state(sid)
+    ds  = STATE.setdefault(sid, {"last_eval": False, "since": now, "n": 0})
+
+    # Debounce raw detector
+    if want_present != ds["last_eval"]:
+        ds["last_eval"] = want_present
+        ds["since"] = now
+        return
+
+    dwell = now - ds["since"]
+
+    # Handle PRESENT transition
+    if want_present and not st["present"] and dwell >= ENTER_DELAY_S:
+        st["present"] = True
+        socketio.emit("presence", {"present": True}, to=sid)
+
+        # Greet only if not speaking and cooldown passed
+        if (not st["speaking"]) and (now - st["last_greet_ts"] > GREET_COOLDOWN):
+            _say_to(sid, "حَيَّاكَ اللَّه! أَنَا رَاشِد، كيف أقدر أخدمك؟", seconds=3.0)
+            st["greeted"] = True
+            st["last_greet_ts"] = now
+
+    # Handle ABSENT transition
+    if (not want_present) and st["present"] and dwell >= LEAVE_DELAY_S:
+        # Avoid farewell while we're speaking or right after
+        if st["speaking"] or (now - st["last_reply_ts"] < POST_SPEECH_GRACE):
+            return
+        st["present"] = False
+        socketio.emit("presence", {"present": False}, to=sid)
+
+        if (now - st["last_farewell_ts"] > BYE_COOLDOWN) and st.get("greeted", False):
+            _say_to(sid, "تَشَرَّفْتُ بِخِدْمَتِكَ، مَعَ السَّلَامَة!", seconds=2.0)
+            st["last_farewell_ts"] = now
+            st["greeted"] = False
+
+# -------------------- Haar cascades (robust lookup) --------------------
+def _haar_path(filename: str) -> str:
+    for d in ("/usr/share/opencv4/haarcascades", "/usr/share/opencv/haarcascades"):
+        p = Path(d, filename)
+        if p.exists(): return str(p)
+    base = getattr(getattr(cv2, "data", None), "haarcascades", None)
+    if base and Path(base, filename).exists():
+        return str(Path(base, filename))
+    local = BASE_DIR / "haarcascades" / filename
+    if local.exists(): return str(local)
+    raise FileNotFoundError(f"Missing {filename}. Install opencv-data or place it in backend/haarcascades/")
+
+FRONTAL = cv2.CascadeClassifier(_haar_path("haarcascade_frontalface_default.xml"))
+PROFILE = cv2.CascadeClassifier(_haar_path("haarcascade_profileface.xml"))
+
+def _detect_presence(gray, do_rotate=False):
+    g = cv2.equalizeHist(gray)
+    faces_f = FRONTAL.detectMultiScale(g, 1.1, 3, minSize=(24, 24))
+    faces_p = PROFILE.detectMultiScale(g, 1.1, 3, minSize=(24, 24))
+    faces = list(faces_f) + list(faces_p)
+    if faces:
+        h, w = g.shape[:2]; area = float(w*h)
+        for (_,_,fw,fh) in faces:
+            if (fw*fh)/area >= SERVER_MIN_AREA:
+                return True
+    if not do_rotate:
+        return False
+    g90 = cv2.rotate(g, cv2.ROTATE_90_CLOCKWISE)
+    if len(FRONTAL.detectMultiScale(g90, 1.1, 3, minSize=(24, 24))) > 0: return True
+    if len(PROFILE.detectMultiScale(g90, 1.1, 3, minSize=(24, 24))) > 0: return True
+    return False
+
+# -------------------- FAST binary frame handler --------------------
+# Lighter OpenCV settings for Pi:
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+try:
+    cv2.setUseOptimized(True)
+except Exception:
+    pass
+
+PROCESS_EVERY_N = int(os.getenv("PROCESS_EVERY_N", 2))  # process 1 in N frames
+
+@socketio.on("client_frame_bin")
+def on_client_frame_bin(raw: bytes, meta=None):
+    try:
+        sid = request.sid
+        ds  = STATE.setdefault(sid, {"last_eval": False, "since": monotonic(), "n": 0})
+        ds["n"] = ds.get("n", 0) + 1
+
+        # Skip some frames to reduce CPU
+        if (ds["n"] % PROCESS_EVERY_N) != 0:
+            return
+
+        # Decode directly to GRAYSCALE (saves a cvtColor)
+        arr  = np.frombuffer(raw, dtype=np.uint8)
+        gray = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            return
+
+        # Defensive downscale (client already sends ~224w)
+        h, w = gray.shape[:2]
+        if w > 224:
+            s = 224.0 / w
+            gray = cv2.resize(gray, (224, int(h*s)), interpolation=cv2.INTER_AREA)
+
+        want_rotate = (ds["n"] % (3*PROCESS_EVERY_N) == 0)  # occasional rotate
+        has_face = _detect_presence(gray, do_rotate=want_rotate)
+        _update_presence_for_sid(sid, has_face)
+    except Exception:
+        logger.exception("client_frame_bin failed")
+
+# -------------------- LLM (safe wrapper, no echo) --------------------
+def _offline_reply(user_text: str) -> str:
+    low = _normalize(user_text)
+    if not low:
+        return "ما سمعت شيئًا. تقدر تعيد كلامك؟"
+    if any(g in low for g in ("سلام", "السلام", "hi", "hello")):
+        return "وعليكم السلام! كيف أقدر أخدمك؟"
+    if any(x in low for x in ("شكرا", "thx", "thanks")):
+        return "عفوًا! هل تحتاج أي شيء آخر؟"
+    return "أكيد! اخبرني أكثر عن طلبك عشان أساعدك."
+
+try:
+    from llm import smart_answer as _llm_smart_answer
+except Exception:
+    _llm_smart_answer = None
+
+def safe_smart_answer(user_text: str) -> str:
+    try:
+        if _llm_smart_answer is not None:
+            out = _llm_smart_answer(user_text) or {}
+            txt = out.get("text")
+            if isinstance(txt, str) and txt.strip():
+                return txt
+    except Exception:
+        logger.exception("smart_answer failed")
+    return _offline_reply(user_text)
+
+# -------------------- Text / Voice handlers (strict gating + dedupe) --------------------
+@socketio.on("voice_input")
+def on_voice_input(data):
+    sid = request.sid
+    st  = _get_state(sid)
+    try:
+        # Ignore user input while TTS is active
+        if st["speaking"]:
+            logger.debug("voice_input ignored (speaking)")
+            return
+
+        user_text = (data or {}).get("text", "").strip()
+        if not user_text:
+            return
+
+        # Dedupe final results that Azure sometimes repeats
+        now = _now()
+        norm = _normalize(user_text)
+        if norm and norm == st["last_user_text"] and (now - st["last_user_ts"]) < STT_DEDUPE_WINDOW:
+            logger.debug("voice_input duplicate ignored")
+            return
+        st["last_user_text"] = norm
+        st["last_user_ts"] = now
+
+        reply = safe_smart_answer(user_text)
+        _say_to(sid, reply, seconds=3.0)
+    except Exception:
+        logger.exception("voice_input failed")
+        _say_to(request.sid, _offline_reply(""), seconds=2.0)
 
 @socketio.on('user_text')
 def on_user_text(data):
-    text = (data or {}).get("text","").strip()
-    if not text:
-        return
-    logger.info(f"🎤 User: {text}")
+    sid = request.sid
+    st  = _get_state(sid)
     try:
-        out = smart_answer(text)          # out dict
-        reply_text = out.get("text","")
+        if st["speaking"]:
+            logger.debug("user_text ignored (speaking)")
+            return
+        txt = (data or {}).get("text", "").strip()
+        if not txt: return
+        reply = safe_smart_answer(txt)
+        _say_to(sid, reply, seconds=3.0)
     except Exception:
-        logger.exception("smart_answer failed")
-        reply_text = "صارت مشكلة بسيطة في المساعد. جرّبي إعادة السؤال."
+        logger.exception("user_text failed")
+        _say_to(sid, _offline_reply(""), seconds=2.0)
 
-    # 🔊 أعلن أن البوت يتكلم
-    socketio.emit("speak_state", {"speaking": True})
-    socketio.emit("voice_response", {"text": reply_text})
-    socketio.emit("server_response", {"data": reply_text})
+# -------------------- Socket basics & TTS sync --------------------
+@socketio.on('connect')
+def on_connect():
+    emit('connection_status', {'status': 'connected'})
 
-    def reset():
-        global is_speaking
-        time.sleep(3)
-        is_speaking = False
-        # ⏹️ بعد ما يخلص أرجع الحالة
-        socketio.emit("speak_state", {"speaking": False})
-    threading.Thread(target=reset, daemon=True).start()
-
-
-
-# ===== ترحيب/توديع بالحضور =====
-def greet_on_arrival():
-    # ترحيب ذكي + قفل الاستماع في الواجهة (speaking=True)
-    reply = " حَيَّاكَ اللَّه! أَنَا رَاشِد، كيف اقدر اخدمك؟"
-    socketio.emit("speak_state", {"speaking": True})
-    socketio.emit('voice_response', {'text': reply})
-    socketio.emit('server_response', {'data': reply})
-    # افتح الميك بعد ما يخلص النطق
-    threading.Thread(target=_end_speaking_after, args=(3.0,), daemon=True).start()
-
-def farewell_on_leave():
-    reply = "تَشَرَّفْتُ بِخِدْمَتِكَ، مَعَ السَّلَامَة!"
-    socketio.emit("speak_state", {"speaking": True})
-    socketio.emit('voice_response', {'text': reply})
-    socketio.emit('server_response', {'data': reply})
-    threading.Thread(target=_end_speaking_after, args=(2.0,), daemon=True).start()
-
-def _end_speaking_after(sec: float):
-    time.sleep(sec)
-    socketio.emit("speak_state", {"speaking": False})
-
-# ========= الرد الذكي =========
-def handle_user_text(user_text: str):
-    logger.info(f"🎤 User: {user_text}")
+@socketio.on("disconnect")
+def on_disconnect():
     try:
-        out = smart_answer(user_text)   # {'text': ..., ...}
-        reply_text = out.get("text", "")
+        CLIENT.pop(request.sid, None)
+        STATE.pop(request.sid, None)
     except Exception:
-        logger.exception("smart_answer failed")
-        reply_text = "صارت مشكلة بسيطة في المساعد. جرّبي إعادة السؤال."
+        pass
 
-    # 🔇 اقفل الاستماع قبل ما نتكلم
-    socketio.emit("speak_state", {"speaking": True})
-    socketio.emit('voice_response', {'text': reply_text})
-    socketio.emit('server_response', {'data': reply_text})
-    # 🔊 افتح الاستماع بعد ما يخلص الصوت
-    threading.Thread(target=_end_speaking_after, args=(4.0,), daemon=True).start()
-
-
-# ===== كاشف الوجه (MediaPipe) =====
-def face_presence_watcher(cam_index=0, greet_delay_s=2.0, farewell_delay_s=5.0,
-                          min_conf=0.6, min_area=0.04):
-    """
-    يراقب الكاميرا ويُفعّل الترحيب بعد ثبات وجود الوجه لمدة greet_delay_s،
-    ويُفعّل التوديع بعد اختفاء الوجه لمدة farewell_delay_s.
-    """
-    global face_present
-    try:
-        import mediapipe as mp
-    except Exception as e:
-        logger.error(f"❌ mediapipe not available: {e}")
-        return
-
-    cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        logger.error("❌ لا أستطيع فتح الكاميرا")
-        return
-
-    mp_fd = mp.solutions.face_detection
-
-    # طوابع زمنية لضبط التأخير
-    first_seen_ts = None         # أول لحظة بدأ فيها الوجه يظهر بشكل متواصل
-    last_seen_ts = None          # آخر لحظة كان فيها الوجه ظاهر
-    greeted = False              # هل قد طُلب الترحيب لهذه الجلسة؟
-
-    with mp_fd.FaceDetection(model_selection=0, min_detection_confidence=min_conf) as fd:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                sleep(0.03)
-                continue
-
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            res = fd.process(rgb)
-
-            # تحقّق وجود وجه بمساحة كافية
-            has_face = False
-            if res and res.detections:
-                for det in res.detections:
-                    bb = det.location_data.relative_bounding_box
-                    if max(bb.width, 0) * max(bb.height, 0) >= min_area:
-                        has_face = True
-                        break
-
-            now = monotonic()
-
-            if has_face:
-                last_seen_ts = now
-                if first_seen_ts is None:
-                    first_seen_ts = now
-
-                # إذا لم نُرحّب بعد، وانتظم الوجود لمدة كافية -> رحّب
-                if not greeted and (now - first_seen_ts) >= greet_delay_s:
-                    face_present = True
-                    greeted = True
-                    socketio.emit("presence", {"present": True})
-                    logger.info("🟢 Face present (stable) -> greet")
-                    greet_on_arrival()
-            else:
-                # لا يوجد وجه: صفّر بداية الظهور، وراقب زمن الغياب
-                first_seen_ts = None
-                if last_seen_ts is not None and greeted:
-                    if (now - last_seen_ts) >= farewell_delay_s:
-                        # غياب مستقر بما يكفي -> وداع
-                        face_present = False
-                        greeted = False
-                        last_seen_ts = None
-                        socketio.emit("presence", {"present": False})
-                        logger.info("⚪ Face absent (stable) -> farewell")
-                        farewell_on_leave()
-
-            # سليب خفيف لتقليل الحمل (لا يعتمد على الزمن كمعيار)
-            sleep(0.03)
-
-
-# ===== التشغيل =====
-if __name__ == "__main__":
-    logger.info("🚀 Starting Rashid Kiosk...")
-    load_video_frames()
-    threading.Thread(target=video_loop, daemon=True).start()
-    threading.Thread(
-    target=face_presence_watcher,
-    args=(0, 2.0, 5.0),  # greet_delay_s=2s, farewell_delay_s=5s
-    daemon=True
-    ).start()
-    logger.info("🌐 Open frontend: frontend/index.html")
-    socketio.run(app, host="0.0.0.0", port=5000, debug=False)
-
-
-
-
-
-
+@socketio.on('start_stream')
+def on_start_stream():
+    b64 = frame_to_b64(get_current_frame())
+    if b64: emit('video_frame', {'frame': b64})
 
 @socketio.on("tts_start")
 def _tts_start():
-    set_speaking(True)
+    st = _get_state(request.sid)
+    st["speaking"] = True
+    socketio.emit("speak_state", {"speaking": True}, to=request.sid)
 
 @socketio.on("tts_end")
 def _tts_end():
-    set_speaking(False)
+    st = _get_state(request.sid)
+    st["speaking"] = False
+    st["last_reply_ts"] = _now()
+    socketio.emit("speak_state", {"speaking": False}, to=request.sid)
+
+# -------------------- Run --------------------
+if __name__ == "__main__":
+    # Lighten OpenCV for Pi (also done above, but safe here too)
+    try: cv2.setNumThreads(1)
+    except Exception: pass
+    try: cv2.setUseOptimized(True)
+    except Exception: pass
+
+    load_video_frames()
+    threading.Thread(target=video_loop, daemon=True).start()
+    socketio.run(app, host="0.0.0.0", port=5000, debug=False)

@@ -1,23 +1,323 @@
-<!-- frontend/index.html -->
 <!doctype html>
 <html lang="ar" dir="rtl">
 <head>
   <meta charset="utf-8" />
-  <title>راشد</title>
+  <title>راشد — المساعد</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="stylesheet" href="./style.css" />
+<style>
+  /* =========== Base =========== */
+  html, body { height: 100%; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Tahoma, sans-serif;
+    background: #111927;
+    color: #E5E7EB;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* =========== Header =========== */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 18px;
+    background: #1F2A37;
+    border-bottom: 1px solid #263241;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; color: #E5E7EB; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: #1B8354; box-shadow: 0 0 10px #1B8354; }
+  .pill { padding: 6px 12px; border-radius: 999px; background: #1F2A37; border: 1px solid #263241; font-size: 13px; color: #9CA3AF; }
+
+  /* =========== Layout (Sidebar | Chat) =========== */
+  main.layout {
+    flex: 1;
+    min-height: 0;            /* allow children to scroll */
+    display: grid;
+    grid-template-columns: 320px 1fr;  /* left sidebar, big chat */
+    gap: 16px;
+    padding: 16px;
+  }
+
+  /* =========== Card Shell =========== */
+  .card {
+    background: #0F1723;      /* slightly darker than #1F2A37 for depth */
+    border: 1px solid #263241;
+    border-radius: 16px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;            /* important for scroll containers inside */
+  }
+
+  /* =========== Sidebar (left) =========== */
+  .sidebar {
+    padding: 16px;
+    gap: 14px;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+  }
+  #localVideo {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    border-radius: 12px;
+    border: 1px solid #263241;
+    object-fit: cover;
+    display: none;            /* shown by main.js when ready */
+    background: #0D1117;
+  }
+  .side-row { display: flex; gap: 10px; align-items: center; }
+  #enableCamBtn {
+    flex: 1;
+    padding: 10px 14px;
+    border-radius: 10px;
+    border: none;
+    background: #1B8354;
+    color: #FFFFFF;
+    cursor: pointer;
+    transition: filter .15s ease, transform .05s ease;
+  }
+  #enableCamBtn:hover { filter: brightness(1.06); }
+  #enableCamBtn:active { transform: translateY(1px); }
+  #cameraStatus { text-align: center; }
+
+  /* =========== Chat (center) =========== */
+  /* Two-column grid inside the chat card: [log | sticky Rashid]; input spans both */
+  .chat {
+    display: grid;
+    grid-template-columns: 1fr 300px;  /* adjust Rashid width here */
+    grid-template-rows: 1fr auto;      /* log grows, input sticks */
+    gap: 16px;
+    min-height: 0;
+    background: #0F1723;
+  }
+
+  /* Sticky Rashid panel (right column) */
+/* The box that holds Rashid */
+.assistant-float {
+  height: 280px;          /* your desired box height */
+  overflow: hidden;       /* hide bottom overflow */
+  border-radius: 14px;
+}
+
+/* Make the video fill & be taller than the box, anchored to the top */
+#rashidVideo {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 110%;       /* >100% ensures extra height to crop from bottom */
+  object-fit: cover;      /* fill without distortion */
+  object-position: top center;  /* anchor on top => bottom gets cropped */
+}
+
+  /* Chat log (left column) */
+  .chat-log {
+    grid-column: 1;
+    grid-row: 1;
+    padding: 20px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-height: 0;
+    background: transparent;
+    border-radius: 12px;
+  }
+
+  /* Bubbles */
+  .msg {
+    max-width: 70%;
+    padding: 12px 16px;
+    border-radius: 14px;
+    font-size: 15px;
+    line-height: 1.5;
+    word-break: break-word;
+  }
+  .msg.bot {
+    align-self: flex-start;
+    background: #1F2A37;
+    border: 1px solid #263241;
+    color: #E5E7EB;
+  }
+  .msg.user {
+    align-self: flex-end;
+    background: #1B8354;
+    color: #FFFFFF;
+  }
+
+  /* Typing indicator */
+  .typing {
+    align-self: flex-start;
+    display: flex;
+    gap: 4px;
+    padding: 10px 14px;
+    background: #1F2A37;
+    border-radius: 14px;
+  }
+  .typing span {
+    width: 6px; height: 6px;
+    background: #9CA3AF;
+    border-radius: 50%;
+    animation: blink 1.2s infinite;
+  }
+  .typing span:nth-child(2) { animation-delay: .2s; }
+  .typing span:nth-child(3) { animation-delay: .4s; }
+  @keyframes blink { 0%, 80%, 100% { opacity: .2; } 40% { opacity: 1; } }
+
+  /* Chat input (spans both columns) */
+  .chat-input {
+    grid-column: 1 / span 2;
+    grid-row: 2;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px;
+    background: #1F2A37;
+    border-top: 1px solid #263241;
+    border-radius: 12px;
+  }
+  .chat-input input {
+    flex: 1;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid #263241;
+    background: #111927;
+    color: #E5E7EB;
+    font-size: 15px;
+    outline: none;
+    transition: border-color .15s ease, box-shadow .15s ease;
+  }
+  .chat-input input:focus {
+    border-color: #1B8354;
+    box-shadow: 0 0 0 3px rgba(27, 131, 84, 0.25);
+  }
+  .chat-input button {
+    padding: 10px 16px;
+    border-radius: 10px;
+    border: none;
+    background: #1B8354;
+    color: #FFFFFF;
+    cursor: pointer;
+    transition: filter .15s ease, transform .05s ease;
+  }
+  .chat-input button:hover { filter: brightness(1.06); }
+  .chat-input button:active { transform: translateY(1px); }
+
+  .micBtn {
+    padding: 10px 14px;
+    border-radius: 50%;
+    background: #24306A;
+    color: #FFFFFF;
+    border: none;
+    cursor: pointer;
+    transition: filter .15s ease, transform .05s ease;
+  }
+  .micBtn:hover { filter: brightness(1.06); }
+  .micBtn:active { transform: translateY(1px); }
+  .micBtn.listening {
+    background: #FF2B77;
+    box-shadow: 0 0 0 6px rgba(255,43,119,0.20);
+  }
+
+  /* =========== Scrollbar (nice) =========== */
+  .chat-log::-webkit-scrollbar { width: 10px; }
+  .chat-log::-webkit-scrollbar-thumb { background: #263241; border-radius: 8px; }
+  .chat-log::-webkit-scrollbar-track { background: #0F1723; }
+
+  /* =========== Responsive =========== */
+  @media (max-width: 1200px) {
+    main.layout { grid-template-columns: 280px 1fr; }
+    .chat { grid-template-columns: 1fr 260px; }
+  }
+
+  @media (max-width: 1024px) {
+    main.layout {
+      grid-template-columns: 1fr;        /* stack sidebar then chat */
+      grid-template-rows: auto 1fr;
+    }
+    .sidebar { order: 1; }
+    .chat { order: 2; }
+    /* Chat reshuffles: Rashid on top (sticky), then log, then input */
+    .chat {
+      grid-template-columns: 1fr;
+      grid-template-rows: auto 1fr auto;
+    }
+    .assistant-float {
+      grid-column: 1;
+      grid-row: 1;
+      position: sticky;
+      top: 12px;
+      max-width: 360px;
+      align-self: start;
+      justify-self: end;       /* keep him floating near edge */
+      margin-inline: 8px;
+    }
+    .chat-log { grid-row: 2; }
+    .chat-input { grid-row: 3; }
+  }
+
+  @media (max-width: 640px) {
+    .chat-input { gap: 8px; padding: 10px; }
+    .chat-input input { font-size: 14px; padding: 10px 12px; }
+    .chat-input button { padding: 10px 12px; }
+    .msg { max-width: 85%; }
+  }
+  
+  
+</style>
+
+
+  <!-- Socket.IO -->
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <!-- Azure Speech SDK -->
+  <script src="https://cdn.jsdelivr.net/npm/microsoft-cognitiveservices-speech-sdk@1.36.0/distrib/browser/microsoft.cognitiveservices.speech.sdk.bundle-min.js"></script>
 </head>
 <body>
-  <main class="app">
-    <div class="video-wrap">
-      <img id="avatar" src="assets/avatar.png" alt="Rashid Avatar" />
+  <header>
+    <div class="brand">
+      <div class="dot" id="statusDot"></div>
+      <div>راشد — المساعد</div>
     </div>
-    <div class="chat">
-      <div id="log" class="log"></div>
-      <div class="mic-status" id="micStatus">⏸️ بانتظار اقتراب شخص أمام الكاميرا…</div>
+    <div class="pill" id="presencePill">بانتظار اقتراب شخص أمام الكاميرا…</div>
+  </header>
+
+<main class="layout">
+  <!-- Left: Sidebar (your camera/status) -->
+  <section class="card sidebar">
+    <video id="localVideo" autoplay muted playsinline></video>
+    <div class="side-row">
+      <button id="enableCamBtn"> تفعيل الكاميرا</button>
     </div>
-  </main>
+    <div class="pill" id="cameraStatus"> الكاميرا غير مفعلة</div>
+  </section>
+
+  <!-- Center: Chat (2-column grid inside: log | sticky Rashid ; input spans both) -->
+  <section class="card chat">
+    <!-- Sticky Rashid (right column) -->
+    <div class="assistant-float" class="video-container">
+      <video id="rashidVideo" autoplay muted loop playsinline>
+        <source src="assets/rashid_silent.mp4" type="video/mp4" />
+      </video>
+    </div>
+
+    <!-- Chat log (left column) -->
+    <div class="chat-log" id="chatLog">
+      <div class="msg bot">مرحباً! كيف أقدر أخدمك؟</div>
+    </div>
+
+    <!-- Input (spans both columns) -->
+    <div class="chat-input">
+      <button id="sttStartBtn" class="micBtn" title="بدء الميكروفون">بدء</button>
+      <button id="sttStopBtn"  class="micBtn" title="إيقاف الميكروفون">إيقاف</button>
+      <input id="chatInput" placeholder="اكتب رسالتك هنا…" />
+      <button id="sendBtn">إرسال</button>
+    </div>
+  </section>
+</main>
+
   <script src="./main.js"></script>
 </body>
 </html>

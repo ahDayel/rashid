@@ -1,182 +1,367 @@
-// ===== Socket.IO =====
-const socket = io("http://localhost:5000", { transports: ["websocket"] });
+// =================== STREAM / PRESENCE ===================
+const FPS          = 3;
+const FRAME_WIDTH  = 224;
+const JPEG_QUALITY = 0.6;
 
-const avatarEl = document.getElementById("avatar");
-const logEl    = document.getElementById("log");
-const micEl    = document.getElementById("micStatus");
+// Azure Speech
+const AZURE_REGION = "qatarcentral";
+const AZURE_VOICE  = "ar-SA-HamedNeural";
+const STT_LANG     = "ar-SA";
 
-function append(kind, text) {
-  const box = document.createElement("div");
-  box.className = kind; // "bot" | "user" | "sys"
-  box.textContent = text;
-  logEl.appendChild(box);
-  logEl.scrollTop = logEl.scrollHeight;
+// ============================ DOM ==========================
+const chatLog      = document.getElementById("chatLog");
+const chatInput    = document.getElementById("chatInput");
+const sendBtn      = document.getElementById("sendBtn");
+const sttStartBtn  = document.getElementById("sttStartBtn");
+const sttStopBtn   = document.getElementById("sttStopBtn");
+
+const rashidVideo  = document.getElementById("rashidVideo");
+const presencePill = document.getElementById("presencePill");
+const statusDot    = document.getElementById("statusDot");
+
+const localVideo   = document.getElementById("localVideo");
+const cameraStatus = document.getElementById("cameraStatus");
+const enableBtn    = document.getElementById("enableCamBtn");
+
+// ============================ Chat UI helpers ==========================
+function addMessage(text, who = "user") {
+  const msg = document.createElement("div");
+  msg.className = "msg " + who;
+  msg.textContent = text;
+  chatLog.appendChild(msg);
+  chatLog.scrollTop = chatLog.scrollHeight;
 }
-const appendBot  = (t)=>append("bot",  "🤖 " + t);
-const appendUser = (t)=>append("user", "👤 " + t);
-const appendSys  = (t)=>append("sys",  t);
+function showTyping() {
+  if (document.getElementById("typingIndicator")) return;
+  const div = document.createElement("div");
+  div.className = "typing";
+  div.innerHTML = "<span></span><span></span><span></span>";
+  div.id = "typingIndicator";
+  chatLog.appendChild(div);
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+function hideTyping() {
+  document.getElementById("typingIndicator")?.remove();
+}
 
-// ====== حالة عامّة ======
-let personPresent   = false;      // من السيرفر (presence)
-let isBotSpeaking   = false;      // من السيرفر (speak_state) + TTS callbacks
-let rec             = null;       // SpeechRecognition instance
-let allowListen     = false;      // إذن الاستماع (وجه موجود + ما فيه كلام)
-let bootedASR       = false;
-let ttsBusy =         false; // يمنع الاستماع أثناء نطق TTS فعليًا
+// ============================ Rashid face video ==========================
+function isSiteAudioPlaying() {
+  return ttsAudio && !ttsAudio.paused && !ttsAudio.ended && ttsAudio.currentTime > 0;
+}
+function setRashidState(state) {
+  // If site audio is playing, force "speaking" until the audio ENDS.
+  if (isSiteAudioPlaying() && state !== "speaking") return;
 
+  if (!rashidVideo) return;
+  let src = "assets/rashid_silent.mp4";
+  if (state === "speaking")  src = "assets/rashid_speaking.mp4";
+  if (state === "listening") src = "assets/rashid_listening.mp4";
 
-// ====== فيديو الرموز ======
-socket.on("video_frame", ({ frame }) => {
-  avatarEl.src = `data:image/jpeg;base64,${frame}`;
+  if (rashidVideo.src.includes(src)) return; // avoid reload if same
+  rashidVideo.src = src;
+  rashidVideo.loop = true;
+  rashidVideo.load();
+  rashidVideo.play().catch(()=>{});
+}
+
+// ============================ Global state ==========================
+let recognizer   = null;
+let isPresent    = false;   // presence from server
+let wantMic      = true;    // user/auto desire to listen when allowed
+let handlingUtterance = false;
+
+// Hidden site-wide audio sink for TTS (and any other site sounds you choose to route)
+const ttsAudio = new Audio();
+ttsAudio.preload = "auto";
+ttsAudio.playsInline = true;
+// Don't show built-in controls; it's a hidden sink
+
+// Whenever site audio starts playing, force "speaking" and block mic
+ttsAudio.addEventListener("playing", () => {
+  setRashidState("speaking");
+  stopAzureSTT(true); // HARD gate: mic off while audio plays
+});
+// Even if paused mid-way, keep speaking look until ENDED per your request
+ttsAudio.addEventListener("pause", () => {
+  if (!ttsAudio.ended) {
+    setRashidState("speaking"); // keep speaking until ended
+  }
+});
+// Only on ENDED we can leave speaking
+ttsAudio.addEventListener("ended", () => {
+  // Decide next state: listen only if presence & user wants & not speaking
+  if (isPresent && wantMic) {
+    startAzureSTT();          // will flip to "listening"
+  } else {
+    setRashidState("silent");
+  }
 });
 
-socket.on("connection_status", ({ status }) => {
-  appendBot(`(اتصال بالخادم: ${status})`);
-});
+// Convenience: route any other <audio>/<video> elements through the same sink
+// Call registerAudioElement(el) on your other players to link their lifecycle to Rashid:
+function registerAudioElement(el) {
+  el.addEventListener("playing", () => {
+    setRashidState("speaking");
+    stopAzureSTT(true);
+  });
+  el.addEventListener("pause", () => {
+    if (!el.ended) setRashidState("speaking");
+  });
+  el.addEventListener("ended", () => {
+    if (isPresent && wantMic) startAzureSTT(); else setRashidState("silent");
+  });
+}
 
-// ====== حضور الكاميرا ======
+// ============================ Gating helpers ==========================
+function setListeningUI(on) {
+  sttStartBtn?.classList.toggle("listening", on);
+}
+
+// ============================ Socket.io ==========================
+const socket = io("/", { transports: ["websocket", "polling"], withCredentials: true });
+
+socket.on("connect", () => { if (statusDot) statusDot.style.background = "#2bd576"; });
+socket.on("connect_error", (e) => addMessage("connect_error: " + e.message,"bot"));
+
+// Presence controls permission; tied to audio sink so we never listen during site audio
 socket.on("presence", ({ present }) => {
-  personPresent = !!present;
-  if (personPresent) {
-    appendBot("تم رصد شخص أمام الكاميرا! 📷");
-  } else {
-    appendBot("الشخص غادر. 👋");
+  isPresent = !!present;
+  if (presencePill) {
+    presencePill.textContent = present ? "تم رصد شخص أمام الكاميرا" : "بانتظار اقتراب شخص أمام الكاميرا…";
   }
-  updateListeningState();
-});
-
-// ====== صوت البوت (TTS) ======
-socket.on("voice_response", ({ text }) => {
-  speak(text);
-});
-
-socket.on("server_response", ({ data }) => {
-  appendBot(data);
-});
-
-// ====== حالة الكلام من السيرفر ======
-socket.on("speak_state", ({ speaking }) => {
-  isBotSpeaking = !!speaking;
-  updateListeningState();
-});
-
-// ====== تحكم الاستماع ======
-function updateListeningState() {
-// يسمح بالاستماع فقط إذا: في شخص + البوت ساكت (من السيرفر) + المتصفح ما ينطق الآن
-  allowListen = personPresent && !isBotSpeaking && !ttsBusy;
-
-
-  if (allowListen) {
-    micEl.textContent = "🎤 أستمع لك الآن...";
-    startASR();
-  } else {
-    micEl.textContent = isBotSpeaking ? "🔊 راشد يتكلم..." : "⏸️ بانتظار اقتراب شخص أمام الكاميرا...";
-    stopASR(true); // abort hard
+  if (!isSiteAudioPlaying()) {
+    if (isPresent && wantMic) startAzureSTT(); else stopAzureSTT(true);
   }
-}
+});
 
-// ====== ASR (Web Speech API) ======
-function ensureASR() {
-  if (bootedASR) return;
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) {
-    appendSys("❌ المتصفح لا يدعم التعرف على الصوت. استخدم Chrome من فضلك.");
-    return;
-  }
-  rec = new SR();
-  rec.lang = "ar-SA";
-  rec.continuous = true;
-  rec.interimResults = false;
+// ====================== CAMERA + SENDER =======================
+let stream = null;
+let loopTimer = null;
+let sending = false;
 
-  rec.onstart = () => { micEl.textContent = "🎤 أستمع لك الآن..."; };
-  rec.onend   = () => {
-    // لا تعيد التشغيل إذا البوت يتكلم أو لا يوجد شخص
-    if (allowListen) {
-      // أعد التشغيل بهدوء
-      try { rec.start(); } catch {}
-    }
-  };
-  rec.onerror = (e) => {
-    // أخطاء الشبكة/المايك تحدث، جرّب بعد قليل ان سمحنا
-    if (allowListen) setTimeout(() => { try { rec.start(); } catch {} }, 400);
-  };
+const sendCanvas = document.createElement("canvas");
+const sendCtx    = sendCanvas.getContext("2d");
 
-  rec.onresult = (e) => {
-    if (!allowListen) return;   // حماية صلبة ضد الإيكو
-    const i = e.resultIndex;
-    const transcript = (e.results[i] && e.results[i][0] && e.results[i][0].transcript || "").trim();
-    if (!transcript) return;
-    appendUser(transcript);
-    socket.emit("voice_input", { text: transcript });
-  };
+async function captureAndSend() {
+  if (sending) return;
+  if (!localVideo || localVideo.readyState < 2 || !localVideo.videoWidth) return;
+  const scale = FRAME_WIDTH / localVideo.videoWidth;
+  sendCanvas.width  = FRAME_WIDTH;
+  sendCanvas.height = Math.round(localVideo.videoHeight * scale);
+  sendCtx.drawImage(localVideo, 0, 0, sendCanvas.width, sendCanvas.height);
 
-  bootedASR = true;
-}
-
-function startASR() {
-  ensureASR();
-  if (!rec) return;
-  // لا تشغّل إذا ما نسمح
-  if (!allowListen) return;
-  // حاول تشغيله، قد يكون already running – لا بأس
-  try { rec.start(); } catch {}
-}
-
-function stopASR(hard=false) {
-  if (!rec) return;
+  sending = true;
   try {
-    if (hard) rec.abort();  // أقوى من stop ويكسر أي onend-autorun
-    else rec.stop();
-  } catch {}
+    await new Promise((resolve) => {
+      sendCanvas.toBlob(async (blob) => {
+        const buf = await blob.arrayBuffer();
+        socket.emit("client_frame_bin", buf);
+        resolve();
+      }, "image/jpeg", JPEG_QUALITY);
+    });
+  } finally { sending = false; }
 }
-
-// ====== TTS ======
-function speak(text) {
-  if (!window.speechSynthesis) return;
-  window.speechSynthesis.cancel();
-
-  const u = new SpeechSynthesisUtterance(text);
-  u.lang = "ar-SA";
-
-  u.onstart = () => {
-    ttsBusy = true;           // المتصفح بدأ ينطق
-    updateListeningState();   // يوقف ASR مباشرة
-  };
-  u.onend = () => {
-    setTimeout(() => {
-      ttsBusy = false;        // خلّص النطق فعليًا
-      updateListeningState(); // اسمح بالاستماع
-    }, 1500);                 // مهلة أمان بعد انتهاء الصوت
-  };
-  u.onerror = () => {
-    setTimeout(() => {
-      ttsBusy = false;
-      updateListeningState();
-    }, 400);
-  };
-
-  window.speechSynthesis.speak(u);
+function startSenderLoop() {
+  clearInterval(loopTimer);
+  loopTimer = setInterval(captureAndSend, Math.max(1, Math.floor(1000 / FPS)));
 }
-
-
-
-// ====== تشغيل أولي ======
-(async function boot() {
-  // اطلب إذن المايك لتفعيل AEC/NS/AGC من المتصفح
+async function startClientCamera() {
   try {
-    await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    if (cameraStatus) cameraStatus.textContent = "Camera: requesting permission...";
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+      audio: false
     });
   } catch (e) {
-    appendSys("⚠️ مشكلة في الميكروفون: تأكد من إعطاء الإذن.");
+    if (cameraStatus) cameraStatus.textContent = `Camera error: ${e.name} - ${e.message}`;
+    addMessage(`getUserMedia failed: ${e.name} - ${e.message}`,"bot");
+    return;
+  }
+  try {
+    localVideo.srcObject = stream;
+    localVideo.muted = true;
+    localVideo.playsInline = true;
+    await new Promise((res) => (localVideo.onloadedmetadata = res));
+    await localVideo.play();
+    localVideo.style.display = "block";
+    if (cameraStatus) cameraStatus.textContent = `Camera: live (${localVideo.videoWidth}×${localVideo.videoHeight})`;
+  } catch (e) {
+    if (cameraStatus) cameraStatus.textContent = "Camera stream error";
+    addMessage("Cannot attach stream: " + e.message,"bot");
+    return;
+  }
+  startSenderLoop();
+}
+enableBtn?.addEventListener("click", () => startClientCamera());
+
+// ============================ Azure token ==========================
+async function getAzureToken() {
+  const r = await fetch("/azure/token", { cache: "no-store" });
+  const t = await r.text();
+  if (!r.ok || !t) throw new Error("azure token fetch failed");
+  return t;
+}
+
+// ============================ STT ==========================
+function stopAzureSTT(silent=false) {
+  if (!recognizer) { setListeningUI(false); return; }
+  recognizer.stopContinuousRecognitionAsync(() => {
+    try { recognizer.close(); } catch {}
+    recognizer = null;
+    setListeningUI(false);
+    // After stopping, if site audio is NOT playing, show silent
+    if (!isSiteAudioPlaying()) setRashidState("silent");
+    if (!silent) addMessage("⏹️ تم الإيقاف.","bot");
+  }, () => {
+    recognizer = null;
+    setListeningUI(false);
+    if (!isSiteAudioPlaying()) setRashidState("silent");
+  });
+}
+
+async function startAzureSTT() {
+  // NEVER start if site audio is playing
+  if (recognizer || !window.SpeechSDK || isSiteAudioPlaying()) return;
+  try {
+    const token = await getAzureToken();
+    const speechConfig = SpeechSDK.SpeechConfig.fromAuthorizationToken(token, AZURE_REGION);
+    speechConfig.speechRecognitionLanguage = STT_LANG;
+
+    // Tighten silence so STT doesn't hang open
+    speechConfig.setProperty(SpeechSDK.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "7000");
+    speechConfig.setProperty(SpeechSDK.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs, "700");
+
+    const audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
+    recognizer = new SpeechSDK.SpeechRecognizer(speechConfig, audioConfig);
+
+    setListeningUI(true);
+    // Do NOT switch to listening yet; only when user actually speaks
+    if (!isSiteAudioPlaying()) setRashidState("silent");
+
+    // When user actually starts speaking, flip to listening
+    if (recognizer.speechStartDetected) {
+      recognizer.speechStartDetected = () => { if (!isSiteAudioPlaying()) setRashidState("listening"); };
+    }
+    recognizer.recognizing = (s, e) => {
+      if (e?.result?.text && !isSiteAudioPlaying()) setRashidState("listening");
+    };
+
+    recognizer.recognized = (s, e) => {
+      const txt = e?.result?.text?.trim();
+      if (!txt || handlingUtterance) return;
+      handlingUtterance = true;
+
+      addMessage(txt,"user");
+      showTyping();
+
+      // Stop mic to avoid picking up TTS
+      stopAzureSTT(true);
+      // emit to server
+      socket.emit("voice_input", { text: txt });
+
+      setTimeout(() => { handlingUtterance = false; }, 600);
+    };
+
+    recognizer.startContinuousRecognitionAsync();
+  } catch (e) {
+    addMessage("STT init failed: " + e,"bot");
+  }
+}
+
+// ============================ TTS (site audio–driven) ==========================
+async function playTTSUntilFinished(text) {
+  // Synthesize to MP3 bytes, then play via the shared ttsAudio element
+  try {
+    if (window.SpeechSDK) {
+      const token = await getAzureToken();
+      const speechConfig = SpeechSDK.SpeechConfig.fromAuthorizationToken(token, AZURE_REGION);
+      speechConfig.speechSynthesisVoiceName = AZURE_VOICE;
+      speechConfig.speechSynthesisOutputFormat =
+        SpeechSDK.SpeechSynthesisOutputFormat.Audio24Khz160KBitRateMonoMp3;
+
+      const synth = new SpeechSDK.SpeechSynthesizer(speechConfig, null);
+      const audioUrl = await new Promise((resolve, reject) => {
+        synth.speakTextAsync(
+          text,
+          (result) => {
+            try {
+              synth.close();
+              const blob = new Blob([result.audioData], { type: "audio/mpeg" });
+              resolve(URL.createObjectURL(blob));
+            } catch (err) { reject(err); }
+          },
+          (err) => { try { synth.close(); } catch {} reject(err); }
+        );
+      });
+
+      // Route playback through our sink (drives Rashid face + mic gating)
+      ttsAudio.src = audioUrl;
+      try { await ttsAudio.play(); } catch (err) { console.warn("audio.play() failed", err); }
+      // We DO NOT resolve here; speaking ends only on ttsAudio 'ended'
+      await new Promise((res) => ttsAudio.addEventListener("ended", res, { once: true }));
+      URL.revokeObjectURL(audioUrl);
+      return;
+    }
+  } catch (e) {
+    console.warn("Azure TTS (data->audio) failed, falling back:", e);
   }
 
-  socket.emit("start_stream");
-  // في البداية، لا نسمع إلا إذا حضر شخص
-  updateListeningState();
-})();
+  // Fallback: Web Speech API (route can't use ttsAudio; we emulate same behavior)
+  await new Promise((res) => {
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "ar-SA";
+    const v = speechSynthesis.getVoices().find(v => v.lang === "ar-SA") || null;
+    if (v) u.voice = v;
 
+    // Simulate the same "speaking" hold: set speaking at start and only release on end
+    u.onstart = () => { setRashidState("speaking"); stopAzureSTT(true); };
+    u.onend   = () => { res(); };
+    speechSynthesis.speak(u);
+  });
+}
 
+// ============================ Bot reply ==========================
+socket.on("voice_response", async ({ text }) => {
+  hideTyping();
+  addMessage(text,"bot");
 
-u.onstart = () => { ttsBusy = true; updateListeningState(); socket.emit("tts_start"); };
-u.onend   = () => { setTimeout(()=>{ ttsBusy = false; updateListeningState(); socket.emit("tts_end"); }, 1500); };
+  // Speak through site audio sink; mic is auto-stopped by audio event handlers
+  try { await playTTSUntilFinished(text); }
+  catch (e) { console.warn("TTS playback failed:", e); }
+
+  // After audio ENDS, the 'ended' listener decides whether to restart STT
+});
+
+// If your backend also emits plain text replies, you may comment this out to avoid duplicates
+// socket.on("server_response", ({ data }) => { addMessage(data,"bot"); });
+
+// ============================ Mic buttons ==========================
+sttStartBtn?.addEventListener("click", () => {
+  wantMic = true;
+  if (!isSiteAudioPlaying() && isPresent) startAzureSTT();
+});
+sttStopBtn ?.addEventListener("click", () => {
+  wantMic = false;
+  stopAzureSTT();
+});
+
+// ============================ Text input ==========================
+sendBtn?.addEventListener("click", () => {
+  const text = chatInput.value.trim();
+  if (!text) return;
+  addMessage(text,"user");
+  chatInput.value="";
+  showTyping();
+
+  // Stop mic so the bot's audio won't be picked up
+  stopAzureSTT(true);
+  socket.emit("voice_input",{ text });
+});
+
+// ============================ Init ==========================
+document.addEventListener("DOMContentLoaded", async () => {
+  setRashidState("silent");
+  try { await startClientCamera(); }
+  catch { if (cameraStatus) cameraStatus.textContent = "Camera: press Enable Camera"; }
+  // Wait for presence before arming STT
+});
